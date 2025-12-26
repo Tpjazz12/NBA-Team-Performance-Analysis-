@@ -1,0 +1,894 @@
+---
+title: "ASDS-6301 Final Project"
+subtitle: "A Regression-Based Analysis of NBA Team Performance"
+author: "Phuong Trinh, Sashi Kumar Soni, Ahmet Toure"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import Packages
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(GGally)
+library(glmnet)
+library(lme4)
+library(broom)
+library(DescTools)   
+library(janitor) 
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+```
+
+# Load dataset 
+
+```{r}
+set.seed(123)
+nba <- read_csv("NBA_FULL_DATASET_2023_2025-2.csv",show_col_types = FALSE)
+head(nba)
+```
+
+# Data Preprocessing 
+
+## Data Cleaning 
+```{r}
+# Check variable names
+nba <- nba %>% clean_names()
+```
+
+## Compute PLUS/MINUS 
+
+```{r}
+library(dplyr)
+
+pm <- nba %>%
+  select(game_id, team_name, opponent, pts) %>%
+  inner_join(
+    nba %>% select(game_id, team_name, pts) %>%
+      rename(opp_team = team_name, opp_pts = pts),
+    by = "game_id"
+  ) %>%
+  filter(team_name != opp_team) %>%
+  group_by(game_id, team_name, opponent) %>%
+  summarise(plus_minus = first(pts - opp_pts), .groups = "drop")
+
+nba <- nba %>%
+  left_join(pm, by = c("game_id", "team_name", "opponent"))
+
+summary(nba$plus_minus)
+```
+
+```{r}
+# Check missing values
+missing_summary <- colSums(is.na(nba))
+missing_summary
+
+missing_summary[missing_summary > 0]
+```
+
+```{r}
+## Handle Missing Values
+
+# 1. Replace missing travel distance with 0 (first game of each team)
+nba <- nba %>%
+  mutate(
+    travel_distance = ifelse(is.na(travel_distance), 0, travel_distance)
+  )
+
+# 2. Replace missing previous coordinates with current coordinates
+nba <- nba %>%
+  mutate(
+    prev_lat = ifelse(is.na(prev_lat), arena_lat, prev_lat),
+    prev_lon = ifelse(is.na(prev_lon), arena_lon, prev_lon)
+  )
+
+# 3. Replace missing previous game date with the season start date
+# (or leave as NA — either is acceptable)
+nba <- nba %>%
+  mutate(
+    prev_game_date = ifelse(is.na(prev_game_date), game_date, prev_game_date)
+  )
+
+# Check again
+colSums(is.na(nba))
+```
+
+```{r}
+# Check duplicate records
+num_duplicates <- sum(duplicated(nba))
+num_duplicates
+
+# Remove duplicates
+nba <- nba %>% distinct()
+```
+
+```{r}
+# Drop team_id and game_id
+nba <- nba %>% select(-team_id, -game_id)
+```
+
+## Descriptive Statistic 
+```{r}
+# Check data types
+str(nba)
+```
+```{r}
+# Convert categorical variables to factors
+nba <- nba %>%
+  mutate(
+    game_date      = as_date(game_date),
+    prev_game_date = as_date(prev_game_date),
+    season         = factor(season),
+    wl             = factor(wl, levels = c("L", "W")),
+    home_away      = factor(home_away),
+    back_to_back   = factor(back_to_back, levels = c("0", "1")),
+    team_name      = factor(team_name),
+    opponent       = factor(opponent)
+  )
+
+summary(nba)
+```
+
+## Feature Engineering 
+
+```{r}
+# Rest_days already computed
+summary(nba$days_rest)
+
+# Back_to_back already computed 
+table(nba$back_to_back)
+
+#Travel_distance already computed
+summary(nba$travel_distance)
+
+# Home_Away convert to numeric 
+nba <- nba %>%
+  mutate(home_indicator = if_else(home_away == "Home", 1, 0))
+
+# Opponent_strength (opp win percentage to date)
+nba <- nba %>%
+  group_by(opponent) %>%
+  arrange(game_date) %>%
+  mutate(
+    opponent_strength = lag(cumsum(w == 1) / row_number(), default = 0)
+  ) %>%
+  ungroup()
+
+summary(nba$opponent_strength)
+```
+## Outlier Detection 
+
+```{r}
+# IQR method
+# travel_distance 
+Q1 <- quantile(nba$travel_distance, 0.25, na.rm = TRUE)
+Q3 <- quantile(nba$travel_distance, 0.75, na.rm = TRUE)
+IQR_val <- Q3 - Q1
+
+upper_bound <- Q3 + 1.5 * IQR_val
+lower_bound <- Q1 - 1.5 * IQR_val
+
+# days_rest
+Q1_rest <- quantile(nba$days_rest, 0.25, na.rm = TRUE)
+Q3_rest <- quantile(nba$days_rest, 0.75, na.rm = TRUE)
+IQR_rest <- Q3_rest - Q1_rest
+
+upper_rest <- Q3_rest + 1.5 * IQR_rest
+lower_rest <- Q1_rest - 1.5 * IQR_rest
+
+# plus_minus
+Q1_pm <- quantile(nba$plus_minus, 0.25, na.rm = TRUE)
+Q3_pm <- quantile(nba$plus_minus, 0.75, na.rm = TRUE)
+IQR_pm <- Q3_pm - Q1_pm
+
+upper_pm <- Q3_pm + 1.5 * IQR_pm
+lower_pm <- Q1_pm - 1.5 * IQR_pm
+
+# Opponent strength
+Q1_str <- quantile(nba$opponent_strength, 0.25, na.rm = TRUE)
+Q3_str <- quantile(nba$opponent_strength, 0.75, na.rm = TRUE)
+IQR_str <- Q3_str - Q1_str
+
+upper_str <- Q3_str + 1.5 * IQR_str
+lower_str <- Q1_str - 1.5 * IQR_str
+
+# Table summary
+outlier_summary <- tibble(
+  variable = c("travel_distance", "days_rest", "plus_minus", "opponent_strength"),
+  lower_bound = c(lower_bound, lower_rest, lower_pm, lower_str),
+  upper_bound = c(upper_bound, upper_rest, upper_pm, upper_str)
+)
+
+outlier_summary
+```
+
+```{r}
+# Visualize the outliers
+library(tidyr)
+library(ggplot2)
+
+plot_data <- nba %>%
+  select(travel_distance, days_rest, plus_minus, opponent_strength) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+ggplot(plot_data, aes(x = variable, y = value)) +
+  geom_boxplot(outlier.color = "red", fill = "lightblue") +
+  theme_minimal() +
+  labs(title = "Outlier Detection Across Key Variables",
+       x = "Variable", y = "Value") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Handling Outliers by Winsorization
+winsorize_manual <- function(x, p = c(0.01, 0.99)) {
+  qnt <- quantile(x, probs = p, na.rm = TRUE)
+  x[x < qnt[1]] <- qnt[1]
+  x[x > qnt[2]] <- qnt[2]
+  return(x)
+}
+
+nba <- nba %>%
+  mutate(
+    travel_distance_w = winsorize_manual(travel_distance)
+  )
+
+library(tidyr)
+
+plot_df <- nba %>%
+  select(travel_distance, travel_distance_w) %>%
+  pivot_longer(cols = everything(), names_to = "type", values_to = "value")
+
+ggplot(plot_df, aes(x = type, y = value)) +
+  geom_boxplot(fill = c("#0072B2", "#009E73"), alpha = 0.8) +
+  labs(
+    title = "Travel Distance: Original vs Winsorized",
+    x = "Version",
+    y = "Travel Distance"
+  ) +
+  theme_minimal()
+
+```
+
+## Normalization and Scaling 
+
+```{r}
+nba <- nba %>%
+  mutate(
+    scale_travel  = scale(travel_distance),
+    scale_rest    = scale(days_rest),
+    scale_plus    = scale(plus_minus),
+    scale_opp_str = scale(opponent_strength)
+  )
+
+## View final cleaned dataset
+#glimpse(nba)
+```
+```{r}
+nba <- nba %>%
+  mutate(
+    back_to_back = as.character(back_to_back),
+    back_to_back_num = ifelse(back_to_back == "1", 1L, 0L),
+    travel_distance_w = ifelse(is.na(travel_distance_w), travel_distance, travel_distance_w)
+  )
+
+```
+
+```{r}
+# Check class distribution for the target variable 'w'
+
+table(nba$wl)
+prop.table(table(nba$wl))
+           
+# Visual bar plot
+library(ggplot2)
+
+ggplot(nba, aes(x = factor(w))) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Distribution of Target Variable: Wins (w)",
+       x = "Wins (w)",
+       y = "Count") +
+  theme_minimal()
+```
+
+# EDA 
+
+## Trend over Time: B2B Games per Season 
+
+NBA scheduling has reduced B2B games over time to improve player rest.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+b2b_trend <- nba %>%
+  group_by(season, team_name) %>%
+  summarise(total_b2b = sum(back_to_back_num, na.rm = TRUE), .groups = "drop") %>%
+  group_by(season) %>%
+  summarise(avg_b2b = base::mean(total_b2b, na.rm = TRUE), .groups = "drop")
+
+ggplot(b2b_trend, aes(season, avg_b2b, group = 1)) +
+  geom_line(color = "red", linewidth = 1.2) +
+  geom_point(color = "darkred", size = 3) +
+  theme_minimal() +
+  labs(title = "Trend in Average Back-to-Back Games per Team",
+       x = "Season", y = "Average B2B Games")
+
+```
+## Average rest days by season 
+
+```{r}
+rest_trend <- nba %>%
+  group_by(season) %>%
+  summarise(avg_rest = base::mean(days_rest, na.rm = TRUE), .groups = "drop")
+
+ggplot(rest_trend, aes(season, avg_rest, group = 1)) +
+  geom_line(color = "#d95f02", linewidth = 1.2) +
+  geom_point(color = "#d95f02", size = 3) +
+  theme_minimal() +
+  labs(title = "Average Days of Rest by Season",
+       x = "Season", y = "Mean Days of Rest")
+```
+## By team: Most B2B and most rest 
+
+```{r, fig.width=10, fig.height=14, fig.retina=2, out.width='95%', fig.align='center'}
+# (A) Teams with the most B2B games (all seasons combined)
+b2b_team <- nba %>%
+  group_by(team_name) %>%
+  summarise(total_b2b = sum(back_to_back_num, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total_b2b))
+
+ggplot(b2b_team, aes(x = reorder(team_name, total_b2b), y = total_b2b)) +
+  geom_col(fill = "firebrick2") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Teams with the Most Back-to-Back Games",
+       x = "Team", y = "Total B2B Games")
+
+# (B) Teams with the highest average rest
+rest_team <- nba %>%
+  group_by(team_name) %>%
+  summarise(avg_rest = base::mean(days_rest, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(avg_rest))
+
+ggplot(rest_team, aes(x = reorder(team_name, avg_rest), y = avg_rest)) +
+  geom_col(fill = "#e6550d") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Teams with Highest Average Rest Days",
+       x = "Team", y = "Average Days of Rest")
+```
+## Interactive full-season schedule viewer
+
+```{r}
+library(dplyr)
+library(plotly)
+
+team_schedule <- function(team) {
+  
+  df <- nba %>%
+    filter(team_name == team) %>%
+    arrange(game_date) %>%
+    mutate(
+      back_to_back_num = case_when(
+        as.character(back_to_back) == "1" ~ 1L,
+        TRUE ~ 0L
+      ),
+      travel_distance_w = ifelse(is.na(travel_distance_w),
+                                 travel_distance,
+                                 travel_distance_w),
+      # jitter y-position so all points aren't on a single line
+      y_jitter = runif(n(), -0.3, 0.3),
+      
+      # color rules
+      color_code = case_when(
+        back_to_back_num == 1 ~ "red",
+        days_rest >= 3 ~ "darkgreen",
+        TRUE ~ "grey"
+      ),
+      
+      # shape: home/away
+      marker_shape = ifelse(home_away == "Home", "circle", "square")
+    )
+  
+  plot_ly(
+    data = df,
+    x = ~game_date,
+    y = ~y_jitter,
+    type = "scatter",
+    mode = "markers",
+    marker = list(
+      size = ~pmin(travel_distance_w / 50 + 8, 20),   # travel scaling
+      color = df$color_code,
+      symbol = ~marker_shape,
+      line = list(width = 1, color = "black")
+    ),
+    text = ~paste0(
+      "<b>Date:</b> ", game_date,
+      "<br><b>Opponent:</b> ", opponent,
+      "<br><b>Home/Away:</b> ", home_away,
+      "<br><b>Days Rest:</b> ", days_rest,
+      "<br><b>Travel (mi):</b> ", round(travel_distance_w, 0),
+      "<br><b>B2B:</b> ", ifelse(back_to_back_num == 1, "Yes", "No")
+    ),
+    hoverinfo = "text"
+  ) %>%
+    layout(
+      title = paste0(team, " — Season Schedule Timeline"),
+      xaxis = list(
+        title = "Game Date",
+        showgrid = TRUE,
+        gridcolor = "lightgrey"
+      ),
+      yaxis = list(
+        title = "",
+        showticklabels = FALSE
+      ),
+      legend = list(orientation = "h")
+    )
+}
+
+# Example:
+team_schedule("Dallas Mavericks")
+```
+
+## Correlation Heatmap 
+
+```{r}
+library(corrplot)
+
+important_vars <- nba %>%
+  select(
+    w_pct,                     # target
+    travel_distance_w,         # travel
+    days_rest,
+    back_to_back,
+    home_indicator,
+    opponent_strength,         # difficulty factor
+    fg_pct, fg3_pct, ft_pct,   # shooting efficiency
+    reb, ast, stl, blk, tov,   # core box score stats
+    plus_minus, pts            # scoring metrics
+  )
+
+
+important_vars <- important_vars %>%
+  mutate(across(everything(), as.numeric))
+
+cor_mat <- cor(important_vars, use = "pairwise.complete.obs")
+```
+
+```{r, fig.width=10, fig.height=10, fig.retina=2, fig.align='center', out.width='90%'}
+corrplot(
+  round(cor_mat, 2),
+  method = "color",
+  type = "lower",
+  order = "hclust",
+  tl.col = "black",
+  tl.srt = 35,
+  tl.cex = 0.9,
+  number.cex = 0.55,
+  number.font = 2,
+  addCoef.col = "black",
+  mar = c(1,1,1,1),
+  cl.cex = 0.8,
+  col = colorRampPalette(c("navy", "white", "darkred"))(200)
+)
+```
+
+# Modeling
+
+```{r}
+# Prepare data for modeling
+nba_glm <- nba %>%
+  mutate(
+    win = ifelse(wl == "W", 1, 0),
+    back_to_back_num = ifelse(back_to_back == "1", 1, 0),
+    travel_distance_w = ifelse(is.na(travel_distance_w), travel_distance, travel_distance_w),
+    home_indicator = ifelse(home_away == "Home", 1, 0)
+  ) %>%
+  select(
+    win,
+    # Schedule factors
+    travel_distance_w,
+    days_rest,
+    back_to_back_num,
+    home_indicator,
+    opponent_strength,
+    # ADD safe performance variables (do NOT leak outcome)
+    fg_pct,
+    fg3_pct,
+    ast,
+    reb,
+    tov
+  ) %>%
+  tidyr::drop_na()
+```
+
+# Logistic Regression Model 
+```{r}
+full_glm <- glm(
+  win ~ travel_distance_w + days_rest + back_to_back_num +
+        home_indicator + opponent_strength +
+        fg_pct + fg3_pct + ast + reb + tov,
+  data = nba_glm,
+  family = binomial(link = "logit")
+)
+
+summary(full_glm)
+```
+
+```{r}
+ll_null <- logLik(glm(win ~ 1, data = nba_glm, family = binomial))
+ll_full <- logLik(full_glm)
+
+# McFadden R2
+R2 <- 1 - (as.numeric(ll_full) / as.numeric(ll_null))
+R2
+
+```
+
+
+# Marginal Plots 
+
+```{r}
+plot(full_glm)
+```
+```{r, message=FALSE, warning=FALSE, fig.width=14, fig.height=9}
+library(ggplot2)
+library(patchwork)
+
+df <- model.frame(full_glm)
+
+make_typical <- function(df) {
+  out <- df[1, , drop = FALSE]
+  for (nm in names(df)) {
+    if (is.numeric(df[[nm]])) {
+      out[[nm]] <- base::mean(df[[nm]], na.rm = TRUE)
+    } else {
+      out[[nm]] <- levels(df[[nm]])[1]
+    }
+  }
+  out
+}
+
+marginal_plot <- function(model, df, var, label = var, n = 100) {
+  base_row <- make_typical(df)
+
+  if (is.numeric(df[[var]])) {
+    lo <- stats::quantile(df[[var]], 0.05, na.rm = TRUE)
+    hi <- stats::quantile(df[[var]], 0.95, na.rm = TRUE)
+    grid <- base_row[rep(1, n), , drop = FALSE]
+    grid[[var]] <- seq(lo, hi, length.out = n)
+  } else {
+    levs <- levels(factor(df[[var]]))
+    grid <- do.call(rbind, lapply(levs, function(L) {
+      r <- base_row
+      r[[var]] <- factor(L, levels = levs)
+      r
+    }))
+  }
+
+  p <- suppressWarnings(predict(model, newdata = grid, type = "link", se.fit = TRUE))
+  grid$fit <- plogis(p$fit)
+  grid$lwr <- plogis(p$fit - 1.96 * p$se.fit)
+  grid$upr <- plogis(p$fit + 1.96 * p$se.fit)
+
+  g <- if (is.numeric(df[[var]])) {
+    ggplot(grid, aes(x = .data[[var]], y = fit)) +
+      geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.15) +
+      geom_line(linewidth = 1)
+  } else {
+    ggplot(grid, aes(x = .data[[var]], y = fit)) +
+      geom_point(size = 3) +
+      geom_errorbar(aes(ymin = lwr, ymax = upr), width = 0.15)
+  }
+
+  g +
+    labs(x = label, y = "Predicted Win Probability") +
+    theme_minimal(base_size = 10) +
+    theme(
+      plot.title = element_blank(),  # ensure no title
+      plot.margin = margin(6, 6, 6, 6)
+    )
+}
+
+p1 <- marginal_plot(full_glm, df, "fg_pct",            "Field Goal %")
+p2 <- marginal_plot(full_glm, df, "fg3_pct",           "3PT %")
+p3 <- marginal_plot(full_glm, df, "reb",               "Rebounds")
+p4 <- marginal_plot(full_glm, df, "tov",               "Turnovers")
+p5 <- marginal_plot(full_glm, df, "home_indicator",    "Home (0/1)")
+p6 <- marginal_plot(full_glm, df, "back_to_back_num",  "Back-to-Back (0/1)")
+p7 <- marginal_plot(full_glm, df, "travel_distance_w", "Travel Distance")
+p8 <- marginal_plot(full_glm, df, "days_rest",         "Days Rest")
+
+# Combine 2×4 with no global annotation
+(p1 | p2 | p3 | p4) /
+(p5 | p6 | p7 | p8)
+```
+## BIC, AIC 
+```{r}
+# Backward elimination (step using AIC; start from full model)
+# (uses base step() which by default uses AIC; change k=log(n) for BIC)
+backward_aic <- step(full_glm, direction = "backward", trace = 1)
+summary(backward_aic)
+ 
+# --- Forward selection (start from intercept; use AIC) ---
+null_mod <- glm(win~ 1, data = nba_glm)  # start with intercept only
+scope_formula <- formula(full_glm)
+ 
+forward_aic <- step(null_mod, scope = scope_formula, direction = "forward", trace = 1)
+summary(forward_aic)
+ 
+```
+
+# Check for Multicollinearity 
+```{r}
+# VIF Check 
+library(car)
+
+vif_values <- vif(full_glm)
+vif_values
+```
+The model performs poorly on held-out testing data even VIF values show < 2. 
+Classic symptom of original overfitting. Then we need Lasso/Ridge. 
+
+# Train/Test Split 
+```{r}
+set.seed(123)
+
+n <- nrow(nba_glm)
+train_idx <- sample(1:n, size = 0.7 * n)
+
+train_data <- nba_glm[train_idx, ]
+test_data  <- nba_glm[-train_idx, ]
+
+y_train <- train_data$win
+y_test  <- test_data$win
+
+# Create the model 
+X_train <- model.matrix(win ~ ., data = train_data)[, -1]
+X_test  <- model.matrix(win ~ ., data = test_data)[, -1]
+```
+
+```{r}
+library(pROC)
+
+# Convert X_test to data frame (glm requires data.frame)
+X_test <- as.data.frame(X_test)
+
+# 1. Get predicted probabilities
+log_prob <- predict(full_glm, newdata = X_test, type = "response")
+
+# 2. Convert y_test to numeric (for WIN target)
+y_num <- as.numeric(as.character(y_test))
+
+# 3. AUC
+log_auc <- auc(y_num, log_prob)
+log_auc
+
+# 4. Convert to classes
+log_pred <- ifelse(log_prob > 0.5, 1, 0)
+
+# 5. Accuracy
+log_accuracy <- base::mean(log_pred == y_num)
+log_accuracy
+
+```
+```{r}
+library(pROC)
+
+log_roc <- roc(response = y_num, predictor = log_prob, levels = c(0,1), direction = "<")
+
+# plot
+plot(log_roc, lwd = 3, main = "ROC Curve — Logistic Regression (Test)")
+abline(a = 0, b = 1, lty = 2)  # diagonal
+legend("bottomright",
+       legend = paste0("AUC = ", round(auc(log_roc), 4)),
+       lwd = 3, bty = "n")
+```
+
+```{r}
+library(caret)
+library(ggplot2)
+library(dplyr)
+
+# --- Confusion matrix (with metrics) ---
+ref  <- factor(y_num,    levels = c(0, 1))   # actual
+pred <- factor(log_pred, levels = c(0, 1))   # predicted
+
+cm <- caret::confusionMatrix(pred, ref, positive = "1")
+cm
+# Quick access to key metrics:
+cm$overall["Accuracy"]
+cm$byClass[c("Sensitivity", "Specificity", "Balanced Accuracy")]
+
+# --- Plot heatmap of confusion matrix ---
+cm_df <- as.data.frame(cm$table) %>%
+  mutate(
+    Reference = factor(Reference, levels = c("0","1"), labels = c("Actual: Loss","Actual: Win")),
+    Prediction = factor(Prediction, levels = c("0","1"), labels = c("Pred: Loss","Pred: Win"))
+  )
+
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Confusion Matrix — Logistic Regression (Test)",
+    x = "", y = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+# Ridge and Lasso Logistic Regression 
+
+```{r}
+# Ridge (alpha=0)
+library(glmnet)
+
+set.seed(123)
+
+ridge_cv <- cv.glmnet(
+  X_train, y_train,
+  family = "binomial",
+  alpha = 0
+)
+
+ridge_model <- glmnet(
+  X_train, y_train,
+  family = "binomial",
+  alpha = 0,
+  lambda = ridge_cv$lambda.min
+)
+
+# Lasso (alpha=1)
+set.seed(123)
+
+lasso_cv <- cv.glmnet(
+  X_train, y_train,
+  family = "binomial",
+  alpha = 1
+)
+
+lasso_model <- glmnet(
+  X_train, y_train,
+  family = "binomial",
+  alpha = 1,
+  lambda = lasso_cv$lambda.min
+)
+```
+```{r}
+# 1) Capture the training column order
+train_cols <- colnames(X_train)
+
+# 2) Recreate the test design matrix with the SAME formula you used for X_train
+#    If you built X_train via: model.matrix(win ~ ., data = train_data)[,-1]
+#    then do the same here:
+X_test <- model.matrix(win ~ ., data = test_data)[, -1, drop = FALSE]
+
+# 3) Add any columns that exist in train but not in test (rare, e.g., missing factor levels)
+missing_cols <- setdiff(train_cols, colnames(X_test))
+if (length(missing_cols) > 0) {
+  add_mat <- matrix(0, nrow = nrow(X_test), ncol = length(missing_cols))
+  colnames(add_mat) <- missing_cols
+  X_test <- cbind(X_test, add_mat)
+}
+
+# 4) Drop any extra columns that appear in test but not train, and reorder to match train
+X_test <- X_test[, train_cols, drop = FALSE]
+
+# 5) Ensure plain numeric matrix (glmnet calls as.matrix internally)
+storage.mode(X_test) <- "double"
+```
+## Predict on TEST DATA 
+```{r}
+# Ridge
+ridge_prob <- as.vector(predict(ridge_model, newx = X_test, type = "response"))
+
+# Lasso
+lasso_prob <- as.vector(predict(lasso_model, newx = X_test, type = "response"))
+```
+## Confusion Matrix 
+```{r}
+## ---- confusion_matrix_plots, message=FALSE, warning=FALSE --------------
+
+# Ensure predicted classes exist
+ridge_pred <- ifelse(ridge_prob >= 0.5, 1, 0)
+lasso_pred <- ifelse(lasso_prob >= 0.5, 1, 0)
+
+# Helper to build cm data.frame in the shape you want
+make_cm_df <- function(actual, predicted) {
+  cm <- table(Reference = actual, Prediction = predicted)
+  df <- as.data.frame(cm)
+  # enforce 0/1 order for clean axis display
+  df$Reference  <- factor(df$Reference,  levels = c(0,1))
+  df$Prediction <- factor(df$Prediction, levels = c(0,1))
+  df
+}
+
+cm_df_ridge <- make_cm_df(y_test, ridge_pred)
+cm_df_lasso <- make_cm_df(y_test, lasso_pred)
+
+library(ggplot2)
+
+# Plot: Ridge
+ggplot(cm_df_ridge, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Confusion Matrix — Ridge (Test)",
+    x = "", y = ""
+  ) +
+  theme_minimal(base_size = 12)
+
+# Plot: Lasso
+ggplot(cm_df_lasso, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Confusion Matrix — Lasso (Test)",
+    x = "", y = ""
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## Compute AUC, Accuracy and ROC Curves
+```{r}
+library(pROC)
+
+# AUC
+ridge_auc <- auc(y_test, ridge_prob)
+lasso_auc <- auc(y_test, lasso_prob)
+
+ridge_auc
+lasso_auc
+
+# Convert to classes
+ridge_pred <- ifelse(ridge_prob > 0.5, 1, 0)
+lasso_pred <- ifelse(lasso_prob > 0.5, 1, 0)
+
+# Accuracy
+ridge_accuracy <- base::mean(ridge_pred == y_test)
+lasso_accuracy <- base::mean(lasso_pred == y_test)
+
+ridge_accuracy
+lasso_accuracy
+```
+## Plot ROC Curves
+```{r}
+ridge_roc <- roc(response = y_test,
+                 predictor = ridge_prob,
+                 levels = c(0, 1),
+                 direction = "<",
+                 quiet = TRUE)
+
+lasso_roc <- roc(response = y_test,
+                 predictor = lasso_prob,
+                 levels = c(0, 1),
+                 direction = "<",
+                 quiet = TRUE)
+
+plot(ridge_roc, col = "darkred", lwd = 3,
+     main = "ROC Curve: Ridge vs Lasso (Test Data)")
+
+plot(lasso_roc, col = "darkgreen", lwd = 3, add = TRUE)
+
+legend("bottomright",
+       legend = c(
+         paste0("Ridge AUC = ", round(ridge_auc, 3)),
+         paste0("Lasso AUC = ", round(lasso_auc, 3))
+       ),
+       col = c("darkred", "darkgreen"),
+       lwd = 3)
+```
